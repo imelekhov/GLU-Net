@@ -1,3 +1,4 @@
 .idea
 *.png
 snapshots
+.DS_Store
