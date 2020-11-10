@@ -1,10 +1,13 @@
 import random
 import pickle
 import numpy as np
+import cv2
 import os
 from os import path as osp
 import matplotlib.pyplot as plt
 from collections import defaultdict
+from PIL import Image
+from utils.pixel_wise_mapping import remap_using_flow_fields
 
 
 if __name__ == '__main__':
@@ -23,24 +26,37 @@ if __name__ == '__main__':
         v_over_models = defaultdict(list)
         scene_uncertainty_u = defaultdict(np.array)
         scene_uncertainty_v = defaultdict(np.array)
+        var_total = defaultdict(np.array)
 
         for model in MODELS:
             fname = osp.join(PRECOMPUTED_RES_PATH, 'model_' + model, scene + '_' + viewpoint + '_flows.pkl')
             with open(fname, 'rb') as f:
                 data = pickle.load(f)
 
+            '''
             for key in keys:
                 u_est = data[key][0, 0].view(1, -1).cpu().numpy().tolist()[0]
                 v_est = data[key][0, 1].view(1, -1).cpu().numpy().tolist()[0]
                 u_over_models[key].append(u_est)
                 v_over_models[key].append(v_est)
+            '''
+            for key in keys:
+                u_est = data[key][0, 0].cpu().numpy()
+                v_est = data[key][0, 1].cpu().numpy()
+                u_over_models[key].append(u_est)
+                v_over_models[key].append(v_est)
 
+        '''
         for key in keys:
             mean_u, var_u = np.mean(u_over_models[key], axis=0), np.var(u_over_models[key], axis=0)
             mean_v, var_v = np.mean(v_over_models[key], axis=0), np.var(v_over_models[key], axis=0)
             scene_uncertainty_u[key] = np.vstack((mean_u, var_u))
             scene_uncertainty_v[key] = np.vstack((mean_v, var_v))
+        '''
+        for key in keys:
+            var_total[key] = np.sqrt(np.var(u_over_models[key], axis=0) + np.var(v_over_models[key], axis=0)) / 2.
 
+        '''
         steps = [1, 10, 100, 10000]
         ax_id = 0
 
@@ -65,51 +81,29 @@ if __name__ == '__main__':
             ax_id += 2
 
         plt.savefig('1.png')
+        '''
+        res_axis_ids = [0, 2, 4, 6]
+        img_axis_ids = [1, 3, 5, 7]
+        fig, axes = plt.subplots(nrows=4, ncols=2, figsize=(15, 20))
+        fig.suptitle("scene: " + scene + ', vp: ' + viewpoint)
+        axes = axes.flatten()
 
-    '''
-    while True:
-        viewpoint = random.sample(viewpoints, 1)[0]
-        uncertainty_res_u = {}
-        uncertainty_res_v = {}
+        for key, ax_id in zip(keys, res_axis_ids):
+            im = axes[ax_id].imshow(var_total[key])
+        cbar_ax = fig.add_axes([0.50, 0.25, 0.02, 0.4])
+        fig.colorbar(im, cax=cbar_ax)
 
-        keys = ["flow4", "flow3", "flow2", "flow_final"]
-        u_over_models = defaultdict(list)
-        v_over_models = defaultdict(list)
+        imgs = []
+        # let's draw images
+        for i, ax_id in enumerate(img_axis_ids[:-2]):
+            img = Image.open(osp.join(DATA_PATH, scene, viewpoint[i] + '.ppm'))
+            im = axes[ax_id].imshow(img)
+            imgs.append(img)
 
-        u_mean, u_var = defaultdict(list), defaultdict(list)
-        v_mean, v_var = defaultdict(list), defaultdict(list)
+        # let's warp an image
+        disp_x, disp_y = np.mean(u_over_models["flow_final"], axis=0), np.mean(v_over_models["flow_final"], axis=0)
+        img_warp = remap_using_flow_fields(np.array(imgs[0]), disp_x, disp_y)
 
-        for model in MODELS:
-            u_over_scenes = defaultdict(float)  # {"flow4": 0., "flow3": 0., "flow2": 0., "flow_final": 0.}
-            v_over_scenes = defaultdict(float)  # {"flow4": 0., "flow3": 0., "flow2": 0., "flow_final": 0.}
-            for i, scene in enumerate(scenes):
-                fname = osp.join(PRECOMPUTED_RES_PATH, 'model_' + model, scene + '_' + viewpoint + '_flows.pkl')
-                with open(fname, 'rb') as f:
-                    data = pickle.load(f)
-
-                for key in keys:
-                    u_over_scenes[key] += data[key][0, 0].view(1, -1).cpu().numpy()
-                    v_over_scenes[key] += data[key][0, 1].view(1, -1).cpu().numpy()
-
-            for key in keys:
-                u_over_scenes[key] /= len(scenes)
-                v_over_scenes[key] /= len(scenes)
-
-                u_over_models[key].append(u_over_scenes[key])
-                v_over_models[key].append(v_over_scenes[key])
-
-        for key in keys:
-            mean_arr_u, var_arr_u = np.mean(u_over_models[key], axis=0), np.var(u_over_models[key], axis=0)
-            mean_arr_v, var_arr_v = np.mean(v_over_models[key], axis=0), np.var(v_over_models[key], axis=0)
-            u_mean[key], u_var[key] = mean_arr_u, var_arr_u
-            v_mean[key], v_var[key] = mean_arr_v, var_arr_v
-
-        key = keys[0]
-        fig = plt.figure()
-        plt.plot(range(len(u_mean[key])), u_mean[key])
-        plt.fill_between(range(len(u_mean[key])),
-                         np.array(u_mean[key]) - 2 * np.array(u_var[key]) ** 0.5,
-                         np.array(u_mean[key]) + 2 * np.array(u_var[key]) ** 0.5,
-                         alpha=0.1)
+        im = axes[img_axis_ids[-2]].imshow(img_warp)
+        im = axes[img_axis_ids[-1]].imshow(np.abs(imgs[1].convert('L') - cv2.cvtColor(img_warp, cv2.COLOR_BGR2GRAY)))
         plt.savefig('1.png')
-    '''
