@@ -12,7 +12,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 import torchvision.transforms as transforms
 import torch.optim.lr_scheduler as lr_scheduler
-from datasets.training_dataset import HomoAffTps_Dataset
+from datasets.training_dataset import HomoAffTps_Dataset, HomoAffTpsNoizyDataset
 from datasets.load_pre_made_dataset import PreMadeDataset
 from utils_training.optimize_GLUNet_with_adaptive_resolution import train_epoch, validate_epoch
 from models.our_models.GLUNet import GLUNet_model
@@ -48,7 +48,7 @@ if __name__ == "__main__":
                         help='start epoch')
     parser.add_argument('--n_epoch', type=int, default=100,
                         help='number of training epochs')
-    parser.add_argument('--batch-size', type=int, default=16,
+    parser.add_argument('--batch-size', type=int, default=4,
                         help='training batch size')
     parser.add_argument('--n_threads', type=int, default=8,
                         help='number of parallel threads for dataloaders')
@@ -71,6 +71,7 @@ if __name__ == "__main__":
     target_img_transforms = transforms.Compose([ArrayToTensor(get_float=False)])
 
     if not args.pre_loaded_training_dataset:
+        '''
         # training dataset, created on the fly at each epoch
         pyramid_param = [520] # means that we get the ground-truth flow field at this size
         train_dataset = HomoAffTps_Dataset(image_path=args.training_data_dir,
@@ -92,6 +93,33 @@ if __name__ == "__main__":
                                          pyramid_param=pyramid_param,
                                          get_flow=True,
                                          output_size=(520, 520))
+        
+        '''
+        pyramid_param = [520]  # means that we get the ground-truth flow field at this size
+        train_dataset = HomoAffTpsNoizyDataset(n_warps=3,
+                                               std=0.005,
+                                               image_path=args.training_data_dir,
+                                               csv_file=osp.join('datasets',
+                                                                 'csv_files',
+                                                                 'train_ade.csv'),
+                                               transforms=source_img_transforms,
+                                               transforms_target=target_img_transforms,
+                                               pyramid_param=pyramid_param,
+                                               get_flow=True,
+                                               output_size=(520, 520))
+        # validation dataset
+        pyramid_param = [520]
+        val_dataset = HomoAffTpsNoizyDataset(n_warps=3,
+                                             std=0.005,
+                                             image_path=args.evaluation_data_dir,
+                                             csv_file=osp.join('datasets',
+                                                               'csv_files',
+                                                               'test_ade.csv'),
+                                             transforms=source_img_transforms,
+                                             transforms_target=target_img_transforms,
+                                             pyramid_param=pyramid_param,
+                                             get_flow=True,
+                                             output_size=(520, 520))
 
     else:
         # If synthetic pairs were already created and saved to disk, run instead of 'train_dataset' the following.

@@ -52,6 +52,27 @@ def pre_process_data(source_img, target_img, device):
     return source_img_copy, target_img_copy, source_img_256, target_img_256
 
 
+def preprocess_image(img, device):
+    # img has shape bx3xhxw
+    b, _, h_scale, w_scale = img.shape
+    mean_vector = np.array([0.485, 0.456, 0.406])
+    std_vector = np.array([0.229, 0.224, 0.225])
+
+    img_preprocessed = img.float().to(device).div(255.0)
+    mean = torch.as_tensor(mean_vector, dtype=img_preprocessed.dtype, device=device)
+    std = torch.as_tensor(std_vector, dtype=img_preprocessed.dtype, device=device)
+    img_preprocessed.sub_(mean[:, None, None]).div_(std[:, None, None])
+    img_preprocessed.sub_(mean[:, None, None]).div_(std[:, None, None])
+
+    # resolution 256x256
+    img_256_preprocessed = torch.nn.functional.interpolate(input=img.float().to(device),
+                                                           size=(256, 256),
+                                                           mode='area').byte()
+    img_256_preprocessed = img_256_preprocessed.float().div(255.0)
+    img_256_preprocessed.sub_(mean[:, None, None]).div_(std[:, None, None])
+    return img_preprocessed, img_256_preprocessed
+
+
 def plot_during_training(save_path, epoch, batch, apply_mask,
                          h_original, w_original, h_256, w_256,
                          source_image, target_image, source_image_256, target_image_256, div_flow,
@@ -173,6 +194,25 @@ def train_epoch(net,
     pbar = tqdm(enumerate(train_loader), total=len(train_loader))
     for i, mini_batch in pbar:
         optimizer.zero_grad()
+
+        print(mini_batch['target_image_nz'].shape)
+        data_in = {}
+        for n, out_keys in zip(["target_image", "source_image", "target_image_nz"],
+                               [("img_target", "img_target_256"),
+                                ("img_source", "img_source_256"),
+                                ("img_target_noisy", "img_target_noisy_256")]):
+            if n == "target_image_nz":
+                fsize_arr, rsize_arr = [], []
+                for id_ in range(mini_batch["target_image_nz"].shape[1]):
+                    fsize, rsize = preprocess_image(mini_batch["target_image_nz"], device)
+                    fsize_arr.append(fsize)
+                    rsize_arr.append(rsize)
+                full_size = torch.stack(fsize_arr)
+                size_256 = torch.stack(rsize_arr)
+            else:
+                full_size, size_256 = preprocess_image(mini_batch[n], device)
+            data_in[out_keys[0]] = full_size
+            data_in[out_keys[1]] = size_256
 
         # pre-process the data
         source_image, target_image, source_image_256, target_image_256 = pre_process_data(mini_batch['source_image'],

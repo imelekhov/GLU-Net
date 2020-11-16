@@ -466,6 +466,215 @@ class HomoAffTps_Dataset(Dataset):
                     'mask_y': mask_y}
 
 
+class HomoAffTpsNoizyDataset(HomoAffTps_Dataset):
+    def __init__(self, n_warps, std, **args):
+        super(HomoAffTpsNoizyDataset, self).__init__(**args)
+        self.n_warps = n_warps
+        self.std = std
+
+    def __getitem__(self, idx):
+        data = self.df.iloc[idx]
+        # get the transformation type flag
+        transform_type = data['aff/tps/homo'].astype('uint8')
+        source_img_name = osp.join(self.img_path, data.fname)
+        if not osp.exists(source_img_name):
+            raise ValueError("The path to one of the original image {} does not exist, check your image path "
+                             "and your csv file !".format(source_img_name))
+
+        if transform_type not in {0, 1, 2}:
+            raise ValueError("Unknown transformation type")
+
+        # read image
+        source_img = cv2.cvtColor(cv2.imread(source_img_name), cv2.COLOR_BGR2RGB)
+
+        img_target_crop_noisy_arr = []
+        # aff/tps transformations
+        if transform_type == 0 or transform_type == 1:
+            # cropping dimention of the image first if it is too big, would occur to big resizing after
+            if source_img.shape[0] > self.H_AFF_TPS*self.ratio_cropping or \
+               source_img.shape[1] > self.W_AFF_TPS*self.ratio_cropping:
+                source_img, x, y = center_crop(source_img, (int(self.W_AFF_TPS*self.ratio_cropping),
+                                                            int(self.H_AFF_TPS*self.ratio_cropping)))
+
+            if transform_type == 0:
+                theta = data.iloc[2:8].values.astype('float').reshape(2, 3)
+                theta = torch.Tensor(theta.astype(np.float32)).expand(1, 2, 3)
+            else:
+                theta = data.iloc[2:].values.astype('float')
+                theta = np.expand_dims(np.expand_dims(theta, 1), 2)
+                theta = torch.Tensor(theta.astype(np.float32))
+                theta = theta.expand(1, 18, 1, 1)
+
+            # make arrays float tensor for subsequent processing
+            image = torch.Tensor(source_img.astype(np.float32))
+
+            if image.numpy().ndim == 2:
+                image = \
+                    torch.Tensor(np.dstack((source_img.astype(np.float32),
+                                            source_img.astype(np.float32),
+                                            source_img.astype(np.float32))))
+            image = image.transpose(1, 2).transpose(0, 1)
+
+            # Resize image using bilinear sampling with identity affine
+            image_pad = self.transform_image(image.unsqueeze(0), self.H_AFF_TPS, self.W_AFF_TPS)
+
+            # padding and crop factor depend where to crop and pad image
+            img_src_crop = \
+                self.transform_image(image_pad,
+                                     self.H_OUT,
+                                     self.W_OUT,
+                                     padding_factor=0.8,
+                                     crop_factor=9/16).squeeze().numpy()
+
+            img_target_crop = \
+                self.transform_image(image_pad,
+                                     self.H_OUT,
+                                     self.W_OUT,
+                                     padding_factor=0.8,
+                                     crop_factor=9/16,
+                                     theta=theta).squeeze().numpy()
+
+            # let's randomly perturb Theta by Gaussian noise
+
+            for _ in range(self.n_warps):
+                theta_noisy = theta + theta.clone().normal_(0, self.std)
+                img_target_crop_noisy = self.transform_image(image_pad,
+                                                             self.H_OUT,
+                                                             self.W_OUT,
+                                                             padding_factor=0.8,
+                                                             crop_factor=9/16,
+                                                             theta=theta_noisy).squeeze().numpy()
+                img_target_crop_noisy_arr.append(img_target_crop_noisy.transpose((1, 2, 0)))
+
+            # convert to [H, W, C] convention (for np arrays)
+            img_src_crop = img_src_crop.transpose((1, 2, 0))
+            img_target_crop = img_target_crop.transpose((1, 2, 0))
+
+        # Homography transformation
+        elif transform_type == 2:
+            # ATTENTION CV2 resize is inverted, first w and then h
+            theta = data.iloc[2:11].values.astype('double').reshape(3, 3)
+
+            # cropping dimention of the image first if it is too big, would occur to big resizing after
+            if source_img.shape[0] > self.H_HOMO * self.ratio_cropping \
+                    or source_img.shape[1] > self.W_HOMO*self.ratio_cropping:
+                source_img, x, y = center_crop(source_img, (int(self.W_HOMO*self.ratio_cropping),
+                                                            int(self.H_HOMO*self.ratio_cropping)))
+
+            # resize to value stated at the beginning
+            img_src_orig = cv2.resize(source_img,
+                                      dsize=(self.W_HOMO, self.H_HOMO),
+                                      interpolation=cv2.INTER_LINEAR)  # cv2.resize, W is giving first
+
+            # get a central crop:
+            img_src_crop, x1_crop, y1_crop = center_crop(img_src_orig,
+                                                         self.W_OUT)
+
+            # Obtaining the full and crop grids out of H
+            grid_full, grid_crop = self.get_grid(theta,
+                                                 ccrop=(x1_crop, y1_crop))
+
+            # warp the fullsize original source image
+            img_src_orig = torch.Tensor(img_src_orig.astype(np.float32))
+            img_src_orig = img_src_orig.permute(2, 0, 1)
+            img_orig_target_vrbl = F.grid_sample(img_src_orig.unsqueeze(0),
+                                                 grid_full)
+            img_orig_target_vrbl = \
+                img_orig_target_vrbl.squeeze().permute(1, 2, 0)
+
+            # get the central crop of the target image
+            img_target_crop, _, _ = center_crop(img_orig_target_vrbl.numpy(),
+                                                self.W_OUT)
+
+            # let's randomly perturb Theta by Gaussian noise
+            img_target_crop_noisy_arr = []
+            for _ in range(self.n_warps):
+                theta_noisy = torch.from_numpy(theta) + torch.from_numpy(theta).clone().normal_(0, self.std)
+                grid_full_nz, grid_crop_nz = self.get_grid(theta_noisy.float().numpy(),
+                                                           ccrop=(x1_crop, y1_crop))
+                img_orig_target_nz = F.grid_sample(img_src_orig.unsqueeze(0),
+                                                   grid_full_nz).squeeze().permute(1, 2, 0).numpy()
+                # get the central crop of the target image
+                img_target_crop_nz, _, _ = center_crop(img_orig_target_nz, self.W_OUT)
+                img_target_crop_noisy_arr.append(img_target_crop_nz)
+
+        if self.transforms_source is not None and self.transforms_target is not None:
+            cropped_source_image = \
+                self.transforms_source(img_src_crop.astype(np.uint8))
+            cropped_target_image = \
+                self.transforms_target(img_target_crop.astype(np.uint8))
+            cropped_target_image_nz = [self.transforms_target(crop.astype(np.uint8))
+                                       for crop in img_target_crop_noisy_arr]
+        else:
+            # if no specific transformations are applied, they are just put in 3xHxW
+            cropped_source_image = \
+                torch.Tensor(img_src_crop.astype(np.float32))
+            cropped_target_image = \
+                torch.Tensor(img_target_crop.astype(np.float32))
+            cropped_target_image_nz = [torch.Tensor(crop.astype(np.float32)) for crop in img_target_crop_noisy_arr]
+
+            # convert to [C, H, W] convention (for tensors)
+            cropped_source_image = cropped_source_image.permute(-1, 0, 1)
+            cropped_target_image = cropped_target_image.permute(-1, 0, 1)
+            cropped_target_image_nz = [crop.permute(-1, 0, 1) for crop in cropped_target_image_nz]
+
+        cropped_target_image_nz = torch.stack(cropped_target_image_nz)
+
+        # construct a pyramid with a corresponding grid on each layer
+        grid_pyramid = []
+        mask_x = []
+        mask_y = []
+        if transform_type == 0:
+            for layer_size in self.pyramid_param:
+                # get layer size or change it so that it corresponds to PWCNet
+                grid = self.generate_grid(layer_size,
+                                          layer_size,
+                                          theta).squeeze(0)
+                mask = grid.ge(-1) & grid.le(1)
+                grid_pyramid.append(grid)
+                mask_x.append(mask[:, :, 0])
+                mask_y.append(mask[:, :, 1])
+        elif transform_type == 1:
+            grid = self.generate_grid(self.H_OUT,
+                                      self.W_OUT,
+                                      theta).squeeze(0)
+            for layer_size in self.pyramid_param:
+                grid_m = torch.from_numpy(cv2.resize(grid.numpy(),
+                                                     (layer_size, layer_size)))
+                mask = grid_m.ge(-1) & grid_m.le(1)
+                grid_pyramid.append(grid_m)
+                mask_x.append(mask[:, :, 0])
+                mask_y.append(mask[:, :, 1])
+        elif transform_type == 2:
+            grid = grid_crop.squeeze(0)
+            for layer_size in self.pyramid_param:
+                grid_m = torch.from_numpy(cv2.resize(grid.numpy(),
+                                                    (layer_size, layer_size)))
+                mask = grid_m.ge(-1) & grid_m.le(1)
+                grid_pyramid.append(grid_m)
+                mask_x.append(mask[:, :, 0])
+                mask_y.append(mask[:, :, 1])
+
+        if self.get_flow:
+            # ATTENTION, here we just get the flow of the highest resolution asked, not the pyramid of flows !
+            flow = unormalise_and_convert_mapping_to_flow(grid_pyramid[-1], output_channel_first=True)
+            return {'source_image': cropped_source_image,
+                    'target_image': cropped_target_image,
+                    'target_image_nz': cropped_target_image_nz,
+                    'flow_map': flow, # here flow map is 2 x h x w
+                    'correspondence_mask': np.logical_and(mask_x[-1].detach().numpy(),
+                                                          mask_y[-1].detach().numpy()).astype(np.uint8)}
+        else:
+            # here we get both the pyramid of mappings and the last mapping (at the highest resolution)
+            return {'source_image': cropped_source_image,
+                    'target_image': cropped_target_image,
+                    'target_image_nz': cropped_target_image_nz,
+                    'correspondence_map': grid_pyramid[-1], #torch tensor,  h x w x 2
+                    'correspondence_map_pyro': grid_pyramid,
+                    'mask_x': mask_x,
+                    'mask_y': mask_y}
+
+
 class TpsGridGen(nn.Module):
     """
     Adopted version of synthetically transformed pairs dataset by I.Rocco

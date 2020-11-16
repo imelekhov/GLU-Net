@@ -45,7 +45,7 @@ class GLUNet_model(nn.Module):
         self.upfeat_channels = upfeat_channels
 
         # improvement of the global correlation
-        self.cyclic_consistency=cyclic_consistency
+        self.cyclic_consistency = cyclic_consistency
         self.consensus_network = consensus_network
         if self.cyclic_consistency:
             self.corr = FeatureCorrelation(shape='4D', normalization=False)
@@ -459,3 +459,165 @@ class GLUNet_model(nn.Module):
             return flow1
         else:
             return [flow4, flow3], [flow2, flow1]
+
+
+class GLUNetNoizy(nn.Module):
+    def __init__(self, **args):
+        super().__init__()
+        self.glunet_orig = GLUNet_model(**args)
+
+    def forward(self, data_dict):
+        # all indices 1 refer to target images
+        # all indices 2 refer to source images
+
+        b, _, h_full, w_full = data_dict["img_target"].size()
+        b, _, h_256, w_256 = data_dict["img_target_256"].size()
+        div = self.glunet_orig.div
+
+        # extract pyramid features
+        with torch.no_grad():
+            im1_pyr = self.glunet_orig.pyramid(data_dict["img_target"], eigth_resolution=True)
+            im2_pyr = self.glunet_orig.pyramid(data_dict["img_source"], eigth_resolution=True)
+            c11 = im1_pyr[-2]  # size original_res/4xoriginal_res/4
+            c21 = im2_pyr[-2]
+            c12 = im1_pyr[-1]  # size original_res/8xoriginal_res/8
+            c22 = im2_pyr[-1]
+
+            # pyramid, 256 reso
+            im1_pyr_256 = self.glunet_orig.pyramid(data_dict["img_target_256"])
+            im2_pyr_256 = self.glunet_orig.pyramid(data_dict["img_source_256"])
+            c13 = im1_pyr_256[-4]
+            c23 = im2_pyr_256[-4]
+            c14 = im1_pyr_256[-3]
+            c24 = im2_pyr_256[-3]
+
+            # noizy (perturbed) images
+            _, n_imgs, _, _, _ = data_dict["img_target_noisy"].shape
+            pyr_n = {}
+            for i in range(n_imgs):
+                im1_n_pyr = self.glunet_orig.pyramid(data_dict["img_target_noisy"][:, i], eigth_resolution=True)
+                pyr_n[i] = im1_n_pyr
+
+        # RESOLUTION 256x256
+        # level 16x16
+        flow4 = self.coarsest_resolution_flow(c14, c24, h_256, w_256)
+        up_flow4 = self.deconv4(flow4)
+
+        # level 32x32
+        ratio_x = 32.0 / float(w_256)
+        ratio_y = 32.0 / float(h_256)
+        up_flow_4_warping = up_flow4 * div
+        up_flow_4_warping[:, 0, :, :] *= ratio_x
+        up_flow_4_warping[:, 1, :, :] *= ratio_y
+        warp3 = warp(c23, up_flow_4_warping)
+        # constrained correlation now
+        corr3 = correlation.FunctionCorrelation(tensorFirst=c13, tensorSecond=warp3)
+        corr3 = self.leakyRELU(corr3)
+        if self.decoder_inputs == 'corr_flow_feat':
+            corr3 = torch.cat((corr3, up_flow4), 1)
+        elif self.decoder_inputs == 'corr':
+            corr3 = corr3
+        elif self.decoder_inputs == 'corr_flow':
+            corr3 = torch.cat((corr3, up_flow4), 1)
+        x3, res_flow3 = self.decoder3(corr3)
+        flow3 = res_flow3 + up_flow4
+        # flow 3 refined (at 32x32 resolution)
+        if self.refinement_at_adaptive_reso or self.refinement_at_all_levels:
+            x = self.dc_conv4(self.dc_conv3(self.dc_conv2(self.dc_conv1(x3))))
+            flow3 = flow3 + self.dc_conv7(self.dc_conv6(self.dc_conv5(x)))
+
+        if self.iterative_refinement and self.evaluation:
+            # from 32x32 resolution, if upsampling to 1/8*original resolution is too big,
+            # do iterative upsampling so that gap is always smaller than 2.
+            R_w = float(w_full) / 8.0 / 32.0
+            R_h = float(h_full) / 8.0 / 32.0
+            if R_w > R_h:
+                R = R_w
+            else:
+                R = R_h
+
+            minimum_ratio = 3.0
+            nbr_extra_layers = max(0, int(round(np.log(R / minimum_ratio) / np.log(2))))
+
+            if nbr_extra_layers == 0:
+                flow3[:, 0, :, :] *= float(w_full) / float(256)
+                flow3[:, 1, :, :] *= float(h_full) / float(256)
+                # ==> put the upflow in the range [Horiginal x Woriginal]
+            else:
+                # adding extra layers
+                flow3[:, 0, :, :] *= float(w_full) / float(256)
+                flow3[:, 1, :, :] *= float(h_full) / float(256)
+                for n in range(nbr_extra_layers):
+                    ratio = 1.0 / (8.0 * 2 ** (nbr_extra_layers - n))
+                    up_flow3 = F.interpolate(input=flow3, size=(int(h_full * ratio), int(w_full * ratio)),
+                                             mode='bilinear',
+                                             align_corners=False)
+                    c23_bis = torch.nn.functional.interpolate(c22, size=(int(h_full * ratio), int(w_full * ratio)),
+                                                              mode='area')
+                    c13_bis = torch.nn.functional.interpolate(c12, size=(int(h_full * ratio), int(w_full * ratio)),
+                                                              mode='area')
+                    warp3 = warp(c23_bis, up_flow3 * div * ratio)
+                    corr3 = correlation.FunctionCorrelation(tensorFirst=c13_bis, tensorSecond=warp3)
+                    corr3 = self.leakyRELU(corr3)
+                    if self.decoder_inputs == 'corr_flow_feat':
+                        corr3 = torch.cat((corr3, up_flow3), 1)
+                    elif self.decoder_inputs == 'corr':
+                        corr3 = corr3
+                    elif self.decoder_inputs == 'corr_flow':
+                        corr3 = torch.cat((corr3, up_flow3), 1)
+                    x, res_flow3 = self.decoder2(corr3)
+                    flow3 = res_flow3 + up_flow3
+
+            # ORIGINAL RESOLUTION
+            up_flow3 = F.interpolate(input=flow3, size=(int(h_full / 8.0), int(w_full / 8.0)), mode='bilinear',
+                                     align_corners=False)
+        else:
+            # ORIGINAL RESOLUTION
+            up_flow3 = F.interpolate(input=flow3, size=(int(h_full / 8.0), int(w_full / 8.0)), mode='bilinear',
+                                     align_corners=False)
+            up_flow3[:, 0, :, :] *= float(w_full) / float(256)
+            up_flow3[:, 1, :, :] *= float(h_full) / float(256)
+            # ==> put the upflow in the range [Horiginal x Woriginal]
+
+        # level 1/8 of original resolution
+        ratio = 1.0 / 8.0
+        warp2 = warp(c22, up_flow3 * div * ratio)
+        corr2 = correlation.FunctionCorrelation(tensorFirst=c12, tensorSecond=warp2)
+        corr2 = self.leakyRELU(corr2)
+        if self.decoder_inputs == 'corr_flow_feat':
+            corr2 = torch.cat((corr2, up_flow3), 1)
+        elif self.decoder_inputs == 'corr':
+            corr2 = corr2
+        elif self.decoder_inputs == 'corr_flow':
+            corr2 = torch.cat((corr2, up_flow3), 1)
+        x2, res_flow2 = self.decoder2(corr2)
+        flow2 = res_flow2 + up_flow3
+        if self.refinement_at_all_levels:
+            x = self.dc_conv4_level2(self.dc_conv3_level2(self.dc_conv2_level2(self.dc_conv1_level2(x2))))
+            flow2 = flow2 + self.dc_conv7_level2(self.dc_conv6_level2(self.dc_conv5_level2(x)))
+
+        up_flow2 = self.deconv2(flow2)
+        if self.decoder_inputs == 'corr_flow_feat':
+            up_feat2 = self.upfeat2(x2)
+
+        # level 1/4 of original resolution
+        ratio = 1.0 / 4.0
+        warp1 = warp(c21, up_flow2 * div * ratio)
+        corr1 = correlation.FunctionCorrelation(tensorFirst=c11, tensorSecond=warp1)
+        corr1 = self.leakyRELU(corr1)
+        if self.decoder_inputs == 'corr_flow_feat':
+            corr1 = torch.cat((corr1, up_flow2, up_feat2), 1)
+        elif self.decoder_inputs == 'corr':
+            corr1 = corr1
+        if self.decoder_inputs == 'corr_flow':
+            corr1 = torch.cat((corr1, up_flow2), 1)
+        x, res_flow1 = self.decoder1(corr1)
+        flow1 = res_flow1 + up_flow2
+        x = self.l_dc_conv4(self.l_dc_conv3(self.l_dc_conv2(self.l_dc_conv1(x))))
+        flow1 = flow1 + self.l_dc_conv7(self.l_dc_conv6(self.l_dc_conv5(x)))
+
+        if self.evaluation:
+            return flow1
+        else:
+            return [flow4, flow3], [flow2, flow1]
+
